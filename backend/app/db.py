@@ -72,6 +72,38 @@ CREATE TABLE IF NOT EXISTS review_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_items_batch ON review_items(batch_id);
+
+-- 分析备忘录（研究者为当前文档撰写的分析笔记，可归档）
+CREATE TABLE IF NOT EXISTS memos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    archived_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memos_doc ON memos(document_id);
+
+-- 备忘录证据：关联标注时保存标注与原文摘录快照；
+-- 标注被删除后 coding_id 置空，快照仍完整保留并在读取时标记「已删除」
+CREATE TABLE IF NOT EXISTS memo_evidences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memo_id INTEGER NOT NULL REFERENCES memos(id) ON DELETE CASCADE,
+    coding_id INTEGER REFERENCES codings(id) ON DELETE SET NULL,
+    code_id INTEGER NOT NULL,
+    code_name TEXT NOT NULL,
+    code_color TEXT NOT NULL,
+    start INTEGER NOT NULL CHECK (start >= 0),
+    "end" INTEGER NOT NULL CHECK ("end" > start),
+    excerpt TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (memo_id, coding_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memo_evidences_memo ON memo_evidences(memo_id);
 """
 
 PALETTE = [
@@ -150,8 +182,8 @@ def _seed(conn: sqlite3.Connection) -> None:
         )
         code_ids[name] = cur.lastrowid
 
-    def add(code: str, anchor: str, occurrence: int = 1) -> None:
-        """按文本锚点定位并写入一条编码，避免手写偏移量出错。"""
+    def add(code: str, anchor: str, occurrence: int = 1) -> int:
+        """按文本锚点定位并写入一条编码，避免手写偏移量出错；返回标注 id。"""
         pos = -1
         from_pos = 0
         for _ in range(occurrence):
@@ -159,13 +191,14 @@ def _seed(conn: sqlite3.Connection) -> None:
             from_pos = pos + 1
         if pos < 0:
             raise ValueError(f"seed anchor not found: {anchor!r}")
-        conn.execute(
+        cur = conn.execute(
             'INSERT INTO codings (document_id, code_id, start, "end") VALUES (?, ?, ?, ?)',
             (doc_id, code_ids[code], pos, pos + len(anchor)),
         )
+        return cur.lastrowid
 
-    add("情绪体验", "那时候我特别焦虑，总觉得工作和生活完全搅在一起了")
-    add("工作边界", "晚上十点还在回消息，因为电脑就摆在那儿")
+    ev1 = add("情绪体验", "那时候我特别焦虑，总觉得工作和生活完全搅在一起了")
+    ev2 = add("工作边界", "晚上十点还在回消息，因为电脑就摆在那儿")
     add("情绪体验", "晚上十点还在回消息")
     add("应对策略", "我给自己定了规矩：早上九点前必须换好衣服坐到桌前，中午出门走二十分钟，晚上七点把电脑收进柜子里")
     add("应对策略", '跟团队约定了"异步优先"的沟通方式')
@@ -177,6 +210,39 @@ def _seed(conn: sqlite3.Connection) -> None:
     add("团队协作", "新人融入困难，我带的一个应届生，入职三个月还没跟团队里一半的人说过话")
     add("工作边界", "需要深度专注的工作留在家里")
     add("应对策略", "开会、讨论、团建放在办公室，需要深度专注的工作留在家里")
+
+    # 示例备忘录：关联两条标注作为证据（保存编码 / 区间 / 原文摘录快照）
+    cur = conn.execute(
+        "INSERT INTO memos (document_id, title, body) VALUES (?, ?, ?)",
+        (
+            doc_id,
+            "初步分析：边界消解与焦虑的循环",
+            "P07 的焦虑并非单纯来自工作量，而是工作与生活边界的消解：物理空间混用"
+            "（餐桌办公）叠加时间边界模糊（深夜回消息），形成持续的待命状态。后续"
+            "分析可关注其「仪式感重建」策略（换装、收电脑）如何逐步修复边界。",
+        ),
+    )
+    memo_id = cur.lastrowid
+    for coding_id in (ev1, ev2):
+        row = conn.execute(
+            'SELECT cg.code_id, cg.start, cg."end", c.name, c.color'
+            " FROM codings cg JOIN codes c ON c.id = cg.code_id WHERE cg.id = ?",
+            (coding_id,),
+        ).fetchone()
+        conn.execute(
+            'INSERT INTO memo_evidences (memo_id, coding_id, code_id, code_name,'
+            ' code_color, start, "end", excerpt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                memo_id,
+                coding_id,
+                row["code_id"],
+                row["name"],
+                row["color"],
+                row["start"],
+                row["end"],
+                SAMPLE_CONTENT[row["start"] : row["end"]],
+            ),
+        )
 
 
 # ---------- 查询辅助 ----------

@@ -141,6 +141,35 @@ class ReviewItemUpdate(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class MemoCreate(BaseModel):
+    """新建备忘录：标题 + 正文，可同时关联本篇若干现存标注作为证据。"""
+
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=20000)
+    coding_ids: list[int] = Field(default_factory=list, max_length=200)
+
+
+class MemoUpdate(BaseModel):
+    """更新备忘录：标题 / 正文必带；coding_ids 为 null 时不改动证据关联。
+
+    coding_ids 提供时按「期望集合」调整证据：已关联的标注保留原快照；集合内
+    尚未关联的标注补建快照；指向现存标注但未列入集合的证据解除关联。指向
+    已删除标注的历史证据默认保留，仅当证据 id 列入 remove_evidence_ids 时
+    才移除。
+    """
+
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=20000)
+    coding_ids: list[int] | None = Field(default=None, max_length=200)
+    remove_evidence_ids: list[int] = Field(default_factory=list, max_length=200)
+
+
+class MemoArchiveUpdate(BaseModel):
+    """归档 / 取消归档备忘录。"""
+
+    archived: bool
+
+
 # ---------- 应用 ----------
 
 @asynccontextmanager
@@ -991,6 +1020,276 @@ def delete_review_batch(document_id: int) -> Response:
     with get_db() as conn:
         get_document_or_404(conn, document_id)
         conn.execute("DELETE FROM review_batches WHERE document_id = ?", (document_id,))
+    return Response(status_code=204)
+
+
+# ---------- 分析备忘录 ----------
+
+def get_memo_or_404(conn, document_id: int, memo_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM memos WHERE id = ? AND document_id = ?",
+        (memo_id, document_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="备忘录不存在")
+    return dict(row)
+
+
+def insert_memo_evidence(conn, memo_id: int, coding: dict, content: str) -> None:
+    """为一条现存标注写入证据快照（编码 / 区间 / 原文摘录）。"""
+    conn.execute(
+        'INSERT INTO memo_evidences (memo_id, coding_id, code_id, code_name,'
+        ' code_color, start, "end", excerpt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (
+            memo_id,
+            coding["id"],
+            coding["code_id"],
+            coding["code_name"],
+            coding["code_color"],
+            coding["start"],
+            coding["end"],
+            content[coding["start"] : coding["end"]],
+        ),
+    )
+
+
+def validate_memo_codings(coding_ids: list[int], coding_by_id: dict) -> list[int]:
+    """去重并校验标注 id 均属于当前文档，返回去重后（保持顺序）的 id 列表。"""
+    ids = list(dict.fromkeys(coding_ids))
+    unknown = [cid for cid in ids if cid not in coding_by_id]
+    if unknown:
+        raise HTTPException(
+            status_code=404, detail=f"标注不存在或不属于当前文档: {unknown}"
+        )
+    return ids
+
+
+def replace_memo_evidences(
+    conn,
+    memo_id: int,
+    wanted: list[int] | None,
+    remove_ids: list[int],
+    coding_by_id: dict,
+    content: str,
+) -> None:
+    """调整备忘录的证据关联（保留已关联快照与已删除标注的历史证据）。
+
+    wanted 为 None 时仅处理 remove_ids 的显式移除；否则按期望集合处理：
+    指向现存标注但未列入集合的证据解除关联，集合内尚未关联的标注补建快照，
+    已关联的标注保留原快照。指向已删除标注（coding_id 为空）的历史证据不受
+    集合影响，仅在 remove_ids 中显式列出时才移除。
+    """
+    rows = conn.execute(
+        "SELECT id, coding_id FROM memo_evidences WHERE memo_id = ?", (memo_id,)
+    ).fetchall()
+    existing = {r["id"]: r["coding_id"] for r in rows}
+    remove_set = set(remove_ids)
+    unknown = [eid for eid in remove_set if eid not in existing]
+    if unknown:
+        raise HTTPException(
+            status_code=404, detail=f"证据不存在或不属于该备忘录: {sorted(unknown)}"
+        )
+    wanted_set = set(wanted) if wanted is not None else None
+    for ev_id, coding_id in existing.items():
+        if ev_id in remove_set:
+            conn.execute("DELETE FROM memo_evidences WHERE id = ?", (ev_id,))
+        elif (
+            wanted_set is not None
+            and coding_id is not None
+            and coding_id not in wanted_set
+        ):
+            conn.execute("DELETE FROM memo_evidences WHERE id = ?", (ev_id,))
+    if wanted_set is not None:
+        surviving = {
+            coding_id
+            for ev_id, coding_id in existing.items()
+            if coding_id is not None
+            and ev_id not in remove_set
+            and coding_id in wanted_set
+        }
+        for cid in wanted:
+            if cid not in surviving:
+                insert_memo_evidence(conn, memo_id, coding_by_id[cid], content)
+
+
+def serialize_memos(conn, document_id: int) -> list[dict]:
+    """组装当前文档的备忘录列表（含证据快照与实时状态），按创建时间倒序。
+
+    证据状态实时比对快照与当前标注：
+      - intact：标注仍存在，且编码 / 区间 / 区间原文与快照一致；
+      - changed：标注仍存在，但编码、区间或区间原文已变化（附当前值对照）；
+      - deleted：原标注已删除（coding_id 已置空），仅保留快照。
+    """
+    doc = get_document_or_404(conn, document_id)
+    content = doc["content"]
+    coding_by_id = {c["id"]: c for c in list_codings(conn, document_id)}
+
+    memo_rows = conn.execute(
+        "SELECT * FROM memos WHERE document_id = ?"
+        " ORDER BY created_at DESC, id DESC",
+        (document_id,),
+    ).fetchall()
+    if not memo_rows:
+        return []
+    ev_rows = conn.execute(
+        """
+        SELECT me.* FROM memo_evidences me
+        JOIN memos m ON m.id = me.memo_id
+        WHERE m.document_id = ?
+        ORDER BY me.id
+        """,
+        (document_id,),
+    ).fetchall()
+
+    ev_by_memo: dict[int, list[dict]] = {}
+    for row in ev_rows:
+        ev = dict(row)
+        coding = (
+            coding_by_id.get(ev["coding_id"]) if ev["coding_id"] is not None else None
+        )
+        if coding is None:
+            status = "deleted"
+            current = None
+        else:
+            cur_text = content[coding["start"] : coding["end"]]
+            changed = (
+                coding["code_id"] != ev["code_id"]
+                or coding["start"] != ev["start"]
+                or coding["end"] != ev["end"]
+                or cur_text != ev["excerpt"]
+            )
+            status = "changed" if changed else "intact"
+            current = {
+                "code_id": coding["code_id"],
+                "code_name": coding["code_name"],
+                "code_color": coding["code_color"],
+                "start": coding["start"],
+                "end": coding["end"],
+                "text": cur_text,
+            }
+        ev_by_memo.setdefault(ev["memo_id"], []).append(
+            {
+                "id": ev["id"],
+                "coding_id": ev["coding_id"],
+                "status": status,
+                # 以下为关联时保存的快照，标注后续变化不影响
+                "code_id": ev["code_id"],
+                "code_name": ev["code_name"],
+                "code_color": ev["code_color"],
+                "start": ev["start"],
+                "end": ev["end"],
+                "excerpt": ev["excerpt"],
+                "created_at": ev["created_at"],
+                "current": current,
+            }
+        )
+
+    memos: list[dict] = []
+    for row in memo_rows:
+        m = dict(row)
+        evidences = ev_by_memo.get(m["id"], [])
+        counts = {"intact": 0, "changed": 0, "deleted": 0}
+        for ev in evidences:
+            counts[ev["status"]] += 1
+        memos.append(
+            {
+                "id": m["id"],
+                "document_id": m["document_id"],
+                "title": m["title"],
+                "body": m["body"],
+                "archived": bool(m["archived"]),
+                "created_at": m["created_at"],
+                "updated_at": m["updated_at"],
+                "archived_at": m["archived_at"],
+                "evidences": evidences,
+                "evidence_counts": {"total": len(evidences), **counts},
+            }
+        )
+    return memos
+
+
+@app.get("/api/documents/{document_id}/memos")
+def list_memos(document_id: int) -> dict:
+    """按创建时间倒序列出当前文档的全部备忘录（含已归档与证据实时状态）。"""
+    with get_db() as conn:
+        get_document_or_404(conn, document_id)
+        return {"memos": serialize_memos(conn, document_id)}
+
+
+@app.post("/api/documents/{document_id}/memos", status_code=201)
+def create_memo(document_id: int, body: MemoCreate) -> dict:
+    """创建备忘录并关联证据：关联时保存标注与原文摘录快照（单事务）。"""
+    with get_db() as conn:
+        doc = get_document_or_404(conn, document_id)
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="备忘录标题不能为空")
+        coding_by_id = {c["id"]: c for c in list_codings(conn, document_id)}
+        coding_ids = validate_memo_codings(body.coding_ids, coding_by_id)
+        cur = conn.execute(
+            "INSERT INTO memos (document_id, title, body) VALUES (?, ?, ?)",
+            (document_id, title, body.body),
+        )
+        for cid in coding_ids:
+            insert_memo_evidence(conn, cur.lastrowid, coding_by_id[cid], doc["content"])
+        return {"memos": serialize_memos(conn, document_id)}
+
+
+@app.put("/api/documents/{document_id}/memos/{memo_id}")
+def update_memo(document_id: int, memo_id: int, body: MemoUpdate) -> dict:
+    """更新备忘录标题 / 正文；coding_ids 提供时同步调整证据关联（单事务）。
+
+    证据调整为「期望集合」语义：已关联标注保留原快照（不随标注后续变化
+    更新）；指向已删除标注的历史证据默认保留，仅在 remove_evidence_ids 中
+    显式列出时才移除。coding_ids 为 null 时不改动任何现存标注的关联。
+    """
+    with get_db() as conn:
+        doc = get_document_or_404(conn, document_id)
+        get_memo_or_404(conn, document_id, memo_id)
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="备忘录标题不能为空")
+        conn.execute(
+            "UPDATE memos SET title = ?, body = ?, updated_at = datetime('now')"
+            " WHERE id = ?",
+            (title, body.body, memo_id),
+        )
+        if body.coding_ids is not None or body.remove_evidence_ids:
+            coding_by_id = {c["id"]: c for c in list_codings(conn, document_id)}
+            wanted = (
+                validate_memo_codings(body.coding_ids, coding_by_id)
+                if body.coding_ids is not None
+                else None
+            )
+            replace_memo_evidences(
+                conn, memo_id, wanted, body.remove_evidence_ids,
+                coding_by_id, doc["content"],
+            )
+        return {"memos": serialize_memos(conn, document_id)}
+
+
+@app.patch("/api/documents/{document_id}/memos/{memo_id}")
+def archive_memo(document_id: int, memo_id: int, body: MemoArchiveUpdate) -> dict:
+    """归档 / 取消归档备忘录；归档记录时间，取消归档清除归档时间。"""
+    with get_db() as conn:
+        get_document_or_404(conn, document_id)
+        get_memo_or_404(conn, document_id, memo_id)
+        conn.execute(
+            "UPDATE memos SET archived = ?,"
+            " archived_at = CASE WHEN ? THEN datetime('now') ELSE NULL END,"
+            " updated_at = datetime('now') WHERE id = ?",
+            (1 if body.archived else 0, 1 if body.archived else 0, memo_id),
+        )
+        return {"memos": serialize_memos(conn, document_id)}
+
+
+@app.delete("/api/documents/{document_id}/memos/{memo_id}", status_code=204)
+def delete_memo(document_id: int, memo_id: int) -> Response:
+    """删除备忘录及其全部证据快照。"""
+    with get_db() as conn:
+        get_document_or_404(conn, document_id)
+        get_memo_or_404(conn, document_id, memo_id)
+        conn.execute("DELETE FROM memos WHERE id = ?", (memo_id,))
     return Response(status_code=204)
 
 

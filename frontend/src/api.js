@@ -100,6 +100,22 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status, note }),
     }),
+  // 分析备忘录：列表（创建时间倒序，含证据快照与 intact/changed/deleted 实时状态）
+  listMemos: (id) => request(`/documents/${id}/memos`),
+  // 创建 {title, body, coding_ids?}：关联标注时保存编码/区间/原文摘录快照
+  createMemo: (id, payload) =>
+    request(`/documents/${id}/memos`, { method: 'POST', body: JSON.stringify(payload) }),
+  // 更新 {title, body, coding_ids?, remove_evidence_ids?}：coding_ids 提供时按期望集合调整证据
+  updateMemo: (id, memoId, payload) =>
+    request(`/documents/${id}/memos/${memoId}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  // 归档 / 取消归档
+  archiveMemo: (id, memoId, archived) =>
+    request(`/documents/${id}/memos/${memoId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ archived }),
+    }),
+  deleteMemo: (id, memoId) =>
+    request(`/documents/${id}/memos/${memoId}`, { method: 'DELETE' }),
   updateCoding: (id, payload) =>
     request(`/codings/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteCoding: (id) => request(`/codings/${id}`, { method: 'DELETE' }),

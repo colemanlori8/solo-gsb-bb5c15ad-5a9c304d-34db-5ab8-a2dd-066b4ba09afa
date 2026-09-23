@@ -91,7 +91,13 @@ docker compose up --build
   - **过期与重生成**：批次生成时锁定文档指纹与标注集合指纹；之后若**文档正文变化**（编辑 / 版本迁移）或**标注变化**（新增 / 删除 / 改区间 / 改编码），批次自动标记为**已过期**（区分两种原因），队列仍可查看但复核操作暂停，提示重新生成；重新生成按最新文档与标注重新稳定抽样并清空此前结论，也可直接删除批次；
   - 抽样设置、复核结论与处理时间均**持久化在 SQLite**（`review_batches` / `review_batch_codes` / `review_items` 三张表），刷新、重启不丢失；每篇文档至多保留一个批次。
   - 对应 `GET/POST/DELETE /api/documents/{id}/review` 与 `PATCH /api/documents/{id}/review/items/{itemId}`。
-- **持久化**：所有文档、编码本、标注与抽样复核批次均存于 SQLite，刷新页面后原样恢复；首次启动自动载入一份示例访谈与编码。
+- **分析备忘录**：正文区顶部切换到「分析备忘录」标签，为当前文档撰写带**标题与正文**的研究备忘录，并可勾选本篇已有标注作为**证据**——
+  - **证据快照**：保存关联时记录标注的**编码、区间与原文摘录快照**；此后标注被修改（改编码 / 改区间 / 区间原文变化）或删除，备忘录仍完整保留原证据，并逐条明确标示**「已变化」**（附当前编码 / 区间 / 原文对照，可一键定位正文）或**「原标注已删除」**；
+  - **证据管理**：编辑备忘录时可增删关联；已关联的标注**保留原快照**（不随标注变化自动更新），指向已删除标注的历史证据默认保留，可在编辑器中显式勾选移除；
+  - **时间线与归档**：备忘录按创建时间排序（**最新 / 最早优先**可切换），展示创建、更新与归档时间；可**归档**（默认收进「已归档」筛选，可随时查看、恢复）或删除；
+  - 备忘录与证据快照均**持久化在 SQLite**（`memos` / `memo_evidences` 两张表），刷新、重启不丢失；
+  - 对应 `GET/POST /api/documents/{id}/memos` 与 `PUT/PATCH/DELETE /api/documents/{id}/memos/{memoId}`。
+- **持久化**：所有文档、编码本、标注、抽样复核批次与分析备忘录均存于 SQLite，刷新页面后原样恢复；首次启动自动载入一份示例访谈与编码。
 
 ## 本地开发（不用 Docker）
 
@@ -129,6 +135,11 @@ npm run dev   # http://localhost:5173
 | POST | `/api/documents/{id}/review` | 生成抽样批次（替换该文档旧批次及全部结论）：请求体 `{codes:[{code_id, sample_size}…]}`；按 `sha256(文档指纹|编码id|标注id)` 稳定排序各取前 N 条，数量超过该编码标注数时取全部；编码不存在返回 404，编码在当前文档无标注（sample_size>0）或重复出现返回 422；返回完整批次 |
 | PATCH | `/api/documents/{id}/review/items/{itemId}` | 标记单条复核结论：请求体 `{status: pending\|approved\|revision, note}`；通过/需修订记录处理时间，pending 清空处理时间；批次已过期返回 409，条目不存在或不属于该文档返回 404；返回完整批次 |
 | DELETE | `/api/documents/{id}/review` | 丢弃当前文档的抽样批次及全部复核结论（204） |
+| GET | `/api/documents/{id}/memos` | 分析备忘录列表（创建时间倒序，含已归档）：每条含标题 / 正文 / 时间戳与证据快照；证据实时比对当前标注，状态为 `intact` / `changed`（附当前值对照）/ `deleted`（原标注已删除，快照保留） |
+| POST | `/api/documents/{id}/memos` | 新建备忘录 `{title, body, coding_ids?}`：关联标注时保存编码 / 区间 / 原文摘录快照（单事务）；标注不存在或不属于该文档返回 404，空标题 422 |
+| PUT | `/api/documents/{id}/memos/{memoId}` | 更新备忘录 `{title, body, coding_ids?, remove_evidence_ids?}`：`coding_ids` 为 `null` 时不改动证据；提供时按期望集合调整（已关联的保留原快照，未列入的现存标注证据解除关联，新出现的补建快照）；指向已删除标注的历史证据仅在 `remove_evidence_ids` 显式列出时移除 |
+| PATCH | `/api/documents/{id}/memos/{memoId}` | 归档 / 取消归档 `{archived: bool}`：归档记录 `archived_at`，取消归档清除 |
+| DELETE | `/api/documents/{id}/memos/{memoId}` | 删除备忘录及其全部证据快照（204） |
 | GET / POST | `/api/codes` | 编码本列表 / 新建（重名返回 409） |
 | PUT / DELETE | `/api/codes/{id}` | 重命名、改色 / 删除（级联删除标注） |
 | POST | `/api/codings/preview` | 冲突预览 `{document_id, code_id, start, end, exclude_id?}` |
@@ -154,11 +165,11 @@ npm run dev   # http://localhost:5173
 │       ├── importing.py      # 标注包导入：指纹 / 映射 / 校验 / 分类（预览计划）纯函数
 │       ├── migration.py      # 文档版本迁移：文本差异对齐 / 区间映射分类（保留·待确认·失配）纯函数
 │       ├── review_sampling.py # 标注抽样复核：文档/标注指纹、稳定散列抽样、原文上下文纯函数
-│       └── db.py             # SQLite 连接、建表（含抽样复核三表）、示例数据
+│       └── db.py             # SQLite 连接、建表（含抽样复核三表、分析备忘录两表）、示例数据
 └── frontend/
     ├── Dockerfile          # 多阶段构建：Vite build → nginx
     ├── nginx.conf          # 静态托管 + /api 反向代理
     └── src/
         ├── App.jsx         # 状态编排与冲突决策流
-        └── components/     # TextView / CodingForm / SearchBatchPanel / ImportDialog / MigrationDialog / ConflictDialog / Sidebar / CooccurrenceView / SpeakerView / DistributionView / GapView / TransitionView / ReviewView
+        └── components/     # TextView / CodingForm / SearchBatchPanel / ImportDialog / MigrationDialog / ConflictDialog / Sidebar / CooccurrenceView / SpeakerView / DistributionView / GapView / TransitionView / ReviewView / MemoView
 ```
