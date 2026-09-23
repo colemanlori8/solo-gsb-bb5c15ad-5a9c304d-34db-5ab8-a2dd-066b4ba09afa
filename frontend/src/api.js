@@ -100,6 +100,33 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status, note }),
     }),
+
+  // 分析备忘录：列表（status: active | archived | all）/ 新建 / 编辑或归档 / 删除
+  listMemos: (docId, status = 'active') =>
+    request(`/documents/${docId}/memos?status=${status}`),
+  createMemo: (docId, { title, body = '', coding_ids = [] }) =>
+    request(`/documents/${docId}/memos`, {
+      method: 'POST',
+      body: JSON.stringify({ title, body, coding_ids }),
+    }),
+  updateMemo: (docId, memoId, patch) =>
+    request(`/documents/${docId}/memos/${memoId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteMemo: (docId, memoId) =>
+    request(`/documents/${docId}/memos/${memoId}`, { method: 'DELETE' }),
+  // 追加 / 移除证据（关联时后端保存标注与原文摘录快照）
+  addMemoEvidence: (docId, memoId, codingIds) =>
+    request(`/documents/${docId}/memos/${memoId}/evidences`, {
+      method: 'POST',
+      body: JSON.stringify({ coding_ids: codingIds }),
+    }),
+  removeMemoEvidence: (docId, memoId, evidenceId) =>
+    request(
+      `/documents/${docId}/memos/${memoId}/evidences/${evidenceId}`,
+      { method: 'DELETE' }
+    ),
   updateCoding: (id, payload) =>
     request(`/codings/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteCoding: (id) => request(`/codings/${id}`, { method: 'DELETE' }),

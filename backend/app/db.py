@@ -72,6 +72,40 @@ CREATE TABLE IF NOT EXISTS review_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_items_batch ON review_items(batch_id);
+
+-- 分析备忘录（按文档组织，可归档；标题 + 正文 + 时间戳）
+CREATE TABLE IF NOT EXISTS memos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'archived')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    archived_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memos_doc ON memos(document_id);
+
+-- 备忘录证据：关联时对标注身份、区间、编码名色与原文摘录做快照；
+-- 标注后续被修改 / 删除（含编码删除导致的级联删除）不影响快照：
+-- coding_id 置空（ON DELETE SET NULL），编码 / 区间 / 摘录原样保留，
+-- 因此 code_id 不加外键，避免编码删除时级联清掉证据。
+CREATE TABLE IF NOT EXISTS memo_evidences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memo_id INTEGER NOT NULL REFERENCES memos(id) ON DELETE CASCADE,
+    coding_id INTEGER REFERENCES codings(id) ON DELETE SET NULL,
+    code_id INTEGER NOT NULL,
+    code_name TEXT NOT NULL,
+    code_color TEXT NOT NULL,
+    start INTEGER NOT NULL CHECK (start >= 0),
+    "end" INTEGER NOT NULL CHECK ("end" > start),
+    excerpt TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memo_evidences_memo ON memo_evidences(memo_id);
 """
 
 PALETTE = [
